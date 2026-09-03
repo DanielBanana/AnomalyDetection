@@ -298,7 +298,14 @@ class AnomalyDetectionManager:
 
         self.datasetSession: Optional[DatasetSession] = None
 
-        self.logDir: Path = self.outputDir / "logs"
+        # Sibling of outputDir ("logs" next to "results"), not nested inside
+        # it -- these are the general, whole-session log files (as opposed
+        # to _attach_run_log_handlers' per-run debug.log/info.log, which
+        # deliberately do live inside each run's own directory alongside
+        # its other artifacts). Computed from outputDir.parent rather than
+        # a hardcoded path so a caller that points outputDir somewhere
+        # other than the default "results" still gets "logs" alongside it.
+        self.logDir: Path = self.outputDir.parent / "logs"
         configure_logging(self.logDir, self.configDir)
 
     def __repr__(self):
@@ -818,6 +825,8 @@ class AnomalyDetectionManager:
         tilingPipelineConfig: TilingPipelineConfig,
         runLabel: Optional[str] = None,
         runId: Optional[str] = None,
+        datasetNameOverride: Optional[str] = None,
+        categoryOverride: Optional[str] = None,
     ) -> RunContext:
         """
         Shared setup for train()/eval()/inference(): resolve paths, wire up tiling,
@@ -837,6 +846,17 @@ class AnomalyDetectionManager:
             one -- lets repeated calls (e.g. one inference() per image during a
             shift session) share a single output directory instead of each
             getting its own. See AD_Worker's shift_* commands.
+        datasetNameOverride, categoryOverride : Optional[str] (optional)
+            Use these instead of datasetSession.datasetName/.category[0] for
+            resolve_output_dir's path -- for predict-only sessions,
+            datasetSession.datasetName/.category are shaped by whatever's
+            actually on disk where the images were captured (an ad hoc
+            per-call name, an incidental folder name), not the product's
+            real dataset/name -- data-selection still needs the real
+            per-sample values (setupDatamodule etc. read datasetSession
+            itself, untouched), only the *results path* should instead read
+            like training's (see AD_Worker._handle_inference/_handle_shift_
+            inspect, the only callers that pass these).
 
         Returns
         -------
@@ -844,9 +864,11 @@ class AnomalyDetectionManager:
             Run name, output directory, checkpoint directory, (checkpoint path, not applicable for tiled)
         """
         runId = runId if runId is not None else generate_run_id(runLabel)
+        resolvedDatasetName = datasetNameOverride if datasetNameOverride is not None else datasetSession.datasetName
+        resolvedCategory = categoryOverride if categoryOverride is not None else (datasetSession.category[0] if datasetSession.category else None)
         outputDir = resolve_output_dir(
-            baseOutputDir=self.baseOutputDir, datasetName=datasetSession.datasetName,
-            modelName=modelConfig.name, runId=runId, category=datasetSession.category[0] if datasetSession.category else None, tiling=True,
+            baseOutputDir=self.baseOutputDir, datasetName=resolvedDatasetName,
+            modelName=modelConfig.name, runId=runId, category=resolvedCategory, tiling=True,
         )
 
         effective_config = serialize_effective_config(trainerConfig, modelConfig, datamoduleConfig, tilingPipelineConfig, datasetSession)
@@ -876,6 +898,7 @@ class AnomalyDetectionManager:
         trainerConfigPath: Optional[Path] = None,
         tilingConfigPath: Optional[Path] = None,
         inferencerConfigPath: Optional[Path] = None,
+        runLabel: Optional[str] = None,
     ) -> RunContext:
         """
         Train the current model on `datasetSession`, creating a new run
@@ -885,6 +908,15 @@ class AnomalyDetectionManager:
         YAMLs alongside the run's manifest (see RunConfigFiles.copy_to) --
         Manager doesn't keep its own copy of them, Product does (see
         setup.Product), so pass `product.modelConfigPath` etc. through here.
+
+        runLabel : Optional[str]
+            Forwarded to _prepareRun -> generate_run_id (run_registry.py),
+            which slots it into the run id as YYYYMMDD-HHMMSS_<label>_<hash>
+            -- the date prefix and hash suffix are generate_run_id's own and
+            always present regardless of this; leave unset for the plain
+            YYYYMMDD-HHMMSS_<hash> form. AD_Worker._handle_train is what
+            actually supplies a value here (the operator's own run label, or
+            the product name if they didn't type one).
 
         Returns
         -------
@@ -897,7 +929,7 @@ class AnomalyDetectionManager:
         """
         datasetSession = self.attachDatasetSession(datasetSession)
         self._require("train")
-        ctx = self._prepareRun(trainerConfig, modelConfig, datasetSession, datamoduleConfig=datamoduleConfig, tilingPipelineConfig=tilingPipelineConfig)
+        ctx = self._prepareRun(trainerConfig, modelConfig, datasetSession, datamoduleConfig=datamoduleConfig, tilingPipelineConfig=tilingPipelineConfig, runLabel=runLabel)
         if not ManagerReadiness.RUN_PREPARED in self.readiness:
             raise ManagerReadinessError(f"Cannot run 'train': missing: {self._STATE_DESCRIPTIONS[ManagerReadiness.RUN_PREPARED]}",
                         missing=[self._STATE_DESCRIPTIONS[ManagerReadiness.RUN_PREPARED]])
@@ -1030,6 +1062,8 @@ class AnomalyDetectionManager:
         trainerConfigPath: Optional[Path] = None,
         tilingConfigPath: Optional[Path] = None,
         inferencerConfigPath: Optional[Path] = None,
+        datasetNameOverride: Optional[str] = None,
+        categoryOverride: Optional[str] = None,
     ) -> None:
         """Run inference: write results under the *current* dataset's output dir,
         but read the checkpoint from `trainingDir` (a prior, separate run).
@@ -1040,6 +1074,17 @@ class AnomalyDetectionManager:
         fresh one -- pass the same value across repeated calls (e.g. one call
         per image during a shift session) to have them all write into a single
         shared results directory.
+
+        datasetNameOverride, categoryOverride : forwarded to _prepareRun --
+        see its own docstring. A predict-only datasetSession's own
+        datasetName/category reflect an ad hoc per-call name and whatever
+        folder the captures happened to sit in, not the product's actual
+        dataset/name, so results otherwise land under a differently-shaped,
+        much less meaningful path than train()/eval()'s
+        <datasetName>/<productName>/<modelName>/tiled/runs/<runId>. Passing
+        these (see AD_Worker._handle_inference/_handle_shift_inspect, which
+        supply the product's real datasetConfig.name/product.name) makes
+        inference's results path match that same shape.
         """
         datasetSession = self.attachDatasetSession(datasetSession)
         if modelTrainingDir is not None:
@@ -1058,7 +1103,10 @@ class AnomalyDetectionManager:
             )
 
         self._require("inference")
-        ctx = self._prepareRun(inferencerConfig, modelConfig, datasetSession, datamoduleConfig, tilingPipelineConfig)
+        ctx = self._prepareRun(
+            inferencerConfig, modelConfig, datasetSession, datamoduleConfig, tilingPipelineConfig,
+            datasetNameOverride=datasetNameOverride, categoryOverride=categoryOverride,
+        )
 
         if not ManagerReadiness.RUN_PREPARED in self.readiness:
             raise ManagerReadinessError(f"Cannot run 'train': missing: {self._STATE_DESCRIPTIONS[ManagerReadiness.RUN_PREPARED]}",

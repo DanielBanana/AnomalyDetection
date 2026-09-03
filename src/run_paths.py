@@ -62,6 +62,16 @@ def resolve_stats_path(trainingDir: Path) -> Path:
     return trainingDir / "stats.json"
 
 
+def resolve_calibration_scores_path(trainingDir: Path) -> Path:
+    """Where calibration_scores.json (per-sample anomaly scores + ground-truth
+    labels from the val/test split, written by AD_Worker._handle_calibrate)
+    lives within a given (already-resolved) training run directory --
+    alongside stats.json, which only keeps the two threshold scalars. This is
+    what lets the GUI's score-distribution histogram be redrawn later from
+    disk without rerunning calibration."""
+    return trainingDir / "calibration_scores.json"
+
+
 def resolve_wandb_manifest_dir(trainingDir: Path) -> Path:
     """Where each tile's W&B run-id manifest lives within a given training run directory."""
     return trainingDir / "wandb_runs"
