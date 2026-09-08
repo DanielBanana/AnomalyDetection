@@ -122,8 +122,8 @@ class ManagerReadiness(IntFlag):
     train()/eval()/inference()/setupTiling() can run yet. Not mutually
     exclusive -- multiple flags accumulate over time as prerequisites are
     met (see _REQUIREMENTS) -- so this is a different kind of "state" than
-    a single-value session/board status (see status.SessionStatus,
-    hardware.duetboard.duetboard.BoardStatus).
+    a single-value session/board status (see core.status.HardwareStatus,
+    workers.duetboard.duet_control.BoardStatus).
 
     Parameters
     ----------

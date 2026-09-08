@@ -5,10 +5,10 @@ Doesn't touch or replace the console's own TQDMProgressBar -- this is a
 second, independent reporter hooked into the same Lightning training loop,
 alongside whatever other callbacks (EarlyStopping, ModelCheckpoint, ...)
 the trainer config already lists. Reports through
-console.commandDispatcher.post_worker_update, the same channel every other
-worker-to-GUI fact in this app goes through (console/ is on sys.path
-alongside AnomalyDetection/src, same as every other cross-package import in
-this app -- see gui_main.py/cli_main.py's own sys.path setup); GUI.py's
+core.command_dispatcher.post_worker_update, the same channel every other
+worker-to-GUI fact in this app goes through (src/ is on sys.path
+alongside submodule_AnomalyDetection/src, same as every other cross-package
+import in this app -- see gui_main.py/cli_main.py's own sys.path setup); GUI.py's
 _onTrainProgress is what consumes it (two progress bars: tiles overall, and
 epochs within whichever tile is currently training).
 """
@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict
 
 from lightning.pytorch.callbacks import Callback
 
-from console.commandDispatcher import post_worker_update
+from core.command_dispatcher import post_worker_update
 
 if TYPE_CHECKING:
     import lightning.pytorch as pl

@@ -6,7 +6,7 @@ predict phase: a tiled-ensemble predict run never calls trainer.fit() (see
 InferenceJob.run in tiling/tiled_ensemble.py, which calls engine.predict()
 directly), so this reacts to the predict loop's own hooks
 (on_predict_start/on_predict_batch_end/on_predict_end) instead of the fit
-loop's. Reports through console.commandDispatcher.post_worker_update under
+loop's. Reports through core.command_dispatcher.post_worker_update under
 its own "predict_progress" kind -- same channel training progress uses, kept
 separate so the GUI doesn't have to guess which run a "progress" update
 belongs to. GUI.py's _onPredictProgress is what consumes it.
@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Dict
 
 from lightning.pytorch.callbacks import Callback
 
-from console.commandDispatcher import post_worker_update
+from core.command_dispatcher import post_worker_update
 
 if TYPE_CHECKING:
     import lightning.pytorch as pl
