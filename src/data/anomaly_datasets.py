@@ -1360,7 +1360,11 @@ def importDataset(path:Path, name:str, overwrite:bool=True, split: Tuple[str,...
     else:
         raise ValueError("split must be 'train', 'test', ('train', 'test') or pred")
 
-    dataset = fod.Dataset(name=name, overwrite=overwrite)
+    # persistent=True: without it, FiftyOne drops this dataset from its
+    # MongoDB the next time a fresh process is the sole connection (its own
+    # delete_non_persistent_datasets() cleanup, which runs automatically on
+    # startup) -- i.e. essentially every GUI/CLI restart.
+    dataset = fod.Dataset(name=name, overwrite=overwrite, persistent=True)
     info = None
     splits:set[Split] = set()
 
@@ -1394,11 +1398,13 @@ def importDataset(path:Path, name:str, overwrite:bool=True, split: Tuple[str,...
 
 def loadTrainingDataFolder(path:Path, name:str, overwrite:bool=False) -> Tuple[fo.Dataset, None]:
     split = "train"
+    # persistent=True -- see importDataset's comment on why this matters.
     dataset = fo.Dataset.from_dir(
         dataset_dir=path,
         dataset_type=fot.ImageDirectory,
         name=name,
-        overwrite=overwrite
+        overwrite=overwrite,
+        persistent=True,
     )
 
     for sample in dataset:
@@ -1416,15 +1422,20 @@ def loadTrainingDataFolder(path:Path, name:str, overwrite:bool=False) -> Tuple[f
 def loadPredictDataset(path:Path, name:str="pred", overwrite:bool=False):
     split = "pred"
     try:
+        # persistent=True -- see importDataset's comment on why this matters.
         dataset = fo.Dataset.from_dir(
             dataset_dir=path,
             dataset_type=fot.ImageDirectory,
             name=name,
-            overwrite=overwrite
+            overwrite=overwrite,
+            persistent=True,
         )
     except ValueError as e:
         logger.error(e)
         dataset:fo.Dataset = fo.load_dataset(name=name)
+        # The dataset already existed under this name -- make sure it's
+        # marked persistent too, in case it was created before this fix.
+        dataset.persistent = True
     for sample in dataset:
         sample["split"] = split
         sample["label_index"] = LabelName.UNKNOWN
