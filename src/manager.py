@@ -827,6 +827,7 @@ class AnomalyDetectionManager:
         runId: Optional[str] = None,
         datasetNameOverride: Optional[str] = None,
         categoryOverride: Optional[str] = None,
+        runKind: str = "training",
     ) -> RunContext:
         """
         Shared setup for train()/eval()/inference(): resolve paths, wire up tiling,
@@ -857,6 +858,11 @@ class AnomalyDetectionManager:
             itself, untouched), only the *results path* should instead read
             like training's (see AD_Worker._handle_inference/_handle_shift_
             inspect, the only callers that pass these).
+        runKind : str (optional)
+            Forwarded to resolve_output_dir -- "training" (default, used by
+            train()/eval()) or "inference" (inference() passes this
+            explicitly), so trained-model runs and predict-only runs land in
+            separate subtrees instead of sharing one runs/ folder.
 
         Returns
         -------
@@ -869,6 +875,7 @@ class AnomalyDetectionManager:
         outputDir = resolve_output_dir(
             baseOutputDir=self.baseOutputDir, datasetName=resolvedDatasetName,
             modelName=modelConfig.name, runId=runId, category=resolvedCategory, tiling=True,
+            runKind=runKind,
         )
 
         effective_config = serialize_effective_config(trainerConfig, modelConfig, datamoduleConfig, tilingPipelineConfig, datasetSession)
@@ -1106,6 +1113,7 @@ class AnomalyDetectionManager:
         ctx = self._prepareRun(
             inferencerConfig, modelConfig, datasetSession, datamoduleConfig, tilingPipelineConfig,
             datasetNameOverride=datasetNameOverride, categoryOverride=categoryOverride,
+            runKind="inference",
         )
 
         if not ManagerReadiness.RUN_PREPARED in self.readiness:
