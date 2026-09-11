@@ -34,15 +34,16 @@ from lightning.pytorch import Callback
 from setup import create_model
 from tiling.tiled_ensemble import TrainTiledEnsemble, EvalTiledEnsemble, InferenceTiledEnsemble
 from tiling.tilingCheckpoints import checkTiledCheckpointsExist
-from run_registry import generate_run_id, serialize_effective_config, write_run_manifest, RunConfigFiles, copy_checkpoints
+from run_registry import generate_run_id, serialize_effective_config, write_run_manifest, RunConfigFiles, copy_checkpoints, reproduce_run
 from run_paths import resolve_checkpoint_paths, resolve_stats_path, resolve_wandb_manifest_dir, resolve_output_dir
 from setup import (
     DataModuleConfig,
-    TrainerConfig, 
-    ModelConfig, 
-    TilingPipelineConfig, 
-    Product, loadProductFromYaml, 
-    DatasetSession, 
+    TrainerConfig,
+    ModelConfig,
+    TilingPipelineConfig,
+    Product, loadProductFromYaml,
+    DatasetConfig,
+    DatasetSession,
     SetupError,
     DatamoduleError,
     DatasetSessionError,
@@ -228,7 +229,7 @@ class AnomalyDetectionManager:
         "setupTiling": ManagerReadiness.MODEL_LOADED,
         "train": ManagerReadiness.MODEL_LOADED | ManagerReadiness.DATASET_LOADED | ManagerReadiness.TILING_CONFIGURED,
         "eval": ManagerReadiness.MODEL_LOADED | ManagerReadiness.DATASET_LOADED | ManagerReadiness.TILING_CONFIGURED | ManagerReadiness.CHECKPOINT_AVAILABLE,
-        "inference": ManagerReadiness.MODEL_LOADED | ManagerReadiness.DATASET_LOADED | ManagerReadiness.TILING_CONFIGURED | ManagerReadiness.CHECKPOINT_AVAILABLE | ManagerReadiness.CALIBRATED
+        "inference": ManagerReadiness.MODEL_LOADED | ManagerReadiness.TILING_CONFIGURED | ManagerReadiness.CHECKPOINT_AVAILABLE | ManagerReadiness.CALIBRATED
     }
 
     _STATE_DESCRIPTIONS: Dict[ManagerReadiness, str] = {
@@ -640,7 +641,87 @@ class AnomalyDetectionManager:
         manager._apply_visualizer_output_dir(outputPath)
 
         return manager, product
-        
+
+    @classmethod
+    def loadFromRunDir(cls, runDir: Path, baseOutputDir: Path) -> Tuple["AnomalyDetectionManager", Product]:
+        """
+        Bootstrap a manager+product straight from a completed run's own
+        frozen config copies (see run_registry.reproduce_run/
+        RunConfigFiles.copy_to), instead of a live product YAML -- lets a
+        caller point at any run_list/best_model_info result and actually
+        use it (e.g. for inference) even without ever calling loadProduct
+        first, or having loaded a different product before.
+
+        configDir is anchored at `runDir/configs` (the frozen copies), not
+        the live configs/ tree -- consistent with why runs archive their
+        own config copies in the first place: anything this manager does
+        afterwards (e.g. archiving further config copies of its own,
+        should it ever train/eval again) stays pinned to this run's own
+        settings, immune to the live tree having changed since.
+
+        dataset.split isn't recorded anywhere in a run's manifest/frozen
+        configs (only name/category are, see reproduce_run) -- the
+        resulting Product's datasetConfig.splits is a placeholder. Harmless
+        for loading a checkpoint to run inference with (this exists for),
+        since dataset_load/DatasetSession.select_category are a separate,
+        operator-driven step that don't consult it.
+
+        Raises FileNotFoundError if `runDir` doesn't have a manifest or
+        frozen config copies (see reproduce_run), or ValueError if the
+        manifest has no dataset name/category recorded (a run this old
+        predates the manifest carrying that at all).
+        """
+        reproduced = reproduce_run(runDir)
+        if reproduced["datasetName"] is None or reproduced["category"] is None:
+            raise ValueError(
+                f"Run manifest at {runDir} has no dataset name/category recorded; "
+                f"cannot bootstrap a product from it."
+            )
+
+        configDir = runDir / "configs"
+        manager = cls(outputDir=baseOutputDir, configDir=configDir)
+        manager.generateModel(modelConfig=reproduced["modelConfig"])
+        manager.setupTiling(reproduced["tilingPipelineConfig"])
+        manager.modelTrainingDir = runDir
+        manager.ckptDir = resolve_checkpoint_paths(runDir)
+        if manager.ckptDir.exists():
+            manager.readiness |= ManagerReadiness.CHECKPOINT_AVAILABLE
+        if resolve_stats_path(runDir).exists():
+            manager.readiness |= ManagerReadiness.CALIBRATED
+        manager._apply_visualizer_output_dir(baseOutputDir)
+
+        datasetName = reproduced["datasetName"]
+        datasetConfig = DatasetConfig(
+            name=datasetName,
+            category=reproduced["category"],
+            splits=("train", "test"),
+            path=(Path("datasets") / datasetName).resolve(),
+        )
+        product = Product(
+            name=reproduced["category"],
+            modelConfig=reproduced["modelConfig"],
+            modelConfigPath=reproduced["modelConfigPath"],
+            modelTrainingDir=runDir,
+            tilingPipelineConfig=reproduced["tilingPipelineConfig"],
+            tilingConfigPath=reproduced["tilingConfigPath"],
+            trainerConfig=reproduced["trainerConfig"],
+            trainerConfigPath=reproduced["trainerConfigPath"],
+            datamoduleConfig=reproduced["datamoduleConfig"],
+            inferencerConfig=reproduced["inferencerConfig"],
+            inferencerConfigPath=reproduced["inferencerConfigPath"],
+            datasetConfig=datasetConfig,
+            datasetPath=datasetConfig.path,
+            # Every run resolve_output_dir creates for this codebase is a
+            # tiled-ensemble one (tiling=True is hardcoded there) -- never
+            # read elsewhere (see Product.enableTiling), so a fixed True
+            # here is simpler and more reliable than trying to infer it
+            # from tilingPipelineConfig, which reproduce_run doesn't
+            # otherwise mark as enabled/disabled.
+            enableTiling=True,
+            selection="latest",
+        )
+        return manager, product
+
     def loadCheckpoint(self, path:Optional[Path], tilingPipelineConfig: TilingPipelineConfig):
         """
         Check if the checkpoints for a tiledEnsemble run (eval, inference) are available at the expected directory

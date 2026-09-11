@@ -153,23 +153,41 @@ class RunConfigFiles:
 
     def copy_to(self, runDir: Path) -> List[Path]:
         """Copy every configured file into `runDir/configs`, mirroring its
-        path relative to `configDir`. Files outside `configDir` fall back to
-        just their filename. Returns the destination paths.
+        path relative to `configDir` -- e.g. configs/Models/InpFormer.yaml,
+        configs/Tiling/TiledEnsemble.yaml, configs/Trainer/Training_
+        InpFormer.yaml, configs/Engine/PreProcessor.yaml, reusing whatever
+        subfolder structure the configs already live in. Only files truly
+        outside `configDir` fall back to just their filename.
+
+        Both `configDir` and each path are resolved (made absolute,
+        symlinks/".." collapsed) before computing the relative path -- a
+        caller passing one of them relative and the other absolute (e.g.
+        Manager.configDir's own default is the relative Path("configs"),
+        while resolve_product_config_path always returns an absolute,
+        already-`.resolve()`d path) would otherwise make relative_to raise
+        ValueError for every single file and silently flatten the whole
+        configs/ tree, which is exactly the bug this guards against.
+
+        Missing files (a stale path pointing at something since moved or
+        deleted) are skipped with a warning rather than raising -- losing
+        one archived config shouldn't abort an otherwise-successful run.
         """
         logger.info(f"Copying files to configs folder of run @ {runDir}")
-        print(f"Copying files to configs folder of run @ {runDir}")
         configsDir = runDir / "configs"
+        resolvedConfigDir = self.configDir.resolve()
         destinations: List[Path] = []
         for path in self._paths():
-            logger.info(f"Path available: {path}")
-            print(f"Path available: {path}")
+            if not path.exists():
+                logger.warning(f"Config file {path} no longer exists; skipping its archived copy for this run.")
+                continue
+            resolvedPath = path.resolve()
             try:
-                relative = path.relative_to(self.configDir)
+                relative = resolvedPath.relative_to(resolvedConfigDir)
             except ValueError:
                 relative = Path(path.name)
             destination = configsDir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
+            shutil.copy2(resolvedPath, destination)
             destinations.append(destination)
         return destinations
 
@@ -614,19 +632,29 @@ def resolve_run_dir(
 # --------------------------------------------------------------------------- #
 
 def reproduce_run(runDir: Path) -> Dict[str, Any]:
-    """Reconstruct the config objects needed to rerun training exactly as it
-    happened, using the FROZEN config copies inside runDir/configs - never the
-    live/shared config tree, which may have changed since the run happened.
+    """Reconstruct the config objects needed to rerun training (or just load
+    the run's checkpoint for inference -- see manager.AnomalyDetectionManager.
+    loadFromRunDir) exactly as it happened, using the FROZEN config copies
+    inside runDir/configs -- never the live/shared config tree, which may
+    have changed since the run happened.
 
-    Returns a dict with keys: modelConfig, trainerConfig, datamoduleConfig,
-    tilingPipelineConfig, original_manifest.
+    Returns a dict with keys: modelConfig, modelConfigPath, trainerConfig,
+    trainerConfigPath, datamoduleConfig, tilingPipelineConfig,
+    tilingConfigPath, inferencerConfig, inferencerConfigPath, datasetName,
+    category, original_manifest. inferencerConfig/inferencerConfigPath fall
+    back to the trainer config/path if no separate inferencer config was
+    archived (an older run, or one that never copied one) -- same "loaded
+    is better than nothing" precedent as tilingPipelineConfig falling back
+    to the manifest's own recorded tiling section below. datasetName/
+    category come from the manifest (the only place they're recorded) and
+    are None if it has neither.
 
     Raises FileNotFoundError if the run directory doesn't have a manifest or
     is missing its frozen config copies.
     """
     # Local imports: keep this module importable without the full config stack
     # loaded, for callers that only want path/listing utilities.
-    from AnomalyDetection.src.setup import ModelConfig, TrainerConfig, DataModuleConfig, TilingPipelineConfig
+    from setup import ModelConfig, TrainerConfig, DataModuleConfig, TilingPipelineConfig
 
     manifestPath = runDir / "manifest.yaml"
     if not manifestPath.exists():
@@ -650,7 +678,20 @@ def reproduce_run(runDir: Path) -> Dict[str, Any]:
         return matches[0]
 
     modelYaml = _first_or_raise("Models/*.yaml", "model")
-    trainerYaml = _first_or_raise("Trainer/*.yaml", "trainer")
+
+    # Trainer and inferencer configs both land under configs/Trainer/ (see
+    # setup.loadProductFromYaml, which resolves both with subdir="Trainer")
+    # -- "Training_*.yaml" is the trainer config by the same naming
+    # convention every model's own config uses (configs/Trainer/Training_
+    # <model>.yaml); whatever else is archived alongside it is the
+    # inferencer config, if one was copied for this run at all.
+    trainerCandidates = sorted((frozenConfigDir / "Trainer").glob("*.yaml"))
+    if not trainerCandidates:
+        raise FileNotFoundError(f"No frozen trainer config found under {frozenConfigDir / 'Trainer'}")
+    trainerYaml = next((p for p in trainerCandidates if p.name.startswith("Training_")), trainerCandidates[0])
+    inferencerCandidates = [p for p in trainerCandidates if p != trainerYaml]
+    inferencerYaml = inferencerCandidates[0] if inferencerCandidates else None
+
     tilingYaml = frozenConfigDir / "Tiling"
     tilingYamlPath = next(iter(sorted(tilingYaml.glob("*.yaml"))), None) if tilingYaml.exists() else None
 
@@ -662,12 +703,27 @@ def reproduce_run(runDir: Path) -> Dict[str, Any]:
         if tilingYamlPath is not None
         else _tiling_config_from_manifest_dict(manifest.get("config", {}).get("tiling", {}))
     )
+    inferencerConfig = (
+        TrainerConfig.load_trainer_config_from_yaml(inferencerYaml) if inferencerYaml is not None else trainerConfig
+    )
+
+    datasetSection = manifest.get("config", {}).get("dataset", {})
+    datasetName = datasetSection.get("name")
+    _category = datasetSection.get("category")
+    category = _category[0] if isinstance(_category, list) and _category else _category
 
     return {
         "modelConfig": modelConfig,
+        "modelConfigPath": modelYaml,
         "trainerConfig": trainerConfig,
+        "trainerConfigPath": trainerYaml,
         "datamoduleConfig": datamoduleConfig,
         "tilingPipelineConfig": tilingPipelineConfig,
+        "tilingConfigPath": tilingYamlPath,
+        "inferencerConfig": inferencerConfig,
+        "inferencerConfigPath": inferencerYaml if inferencerYaml is not None else trainerYaml,
+        "datasetName": datasetName,
+        "category": category,
         "original_manifest": manifest,
     }
 
