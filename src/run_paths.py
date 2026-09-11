@@ -20,10 +20,11 @@ def resolve_output_dir(
     runId: str,
     category: Optional[str] = None,
     tiling: bool = True,
+    runKind: str = "training",
 ) -> Path:
     """
-    Where new artifacts for a run should be written: base/dataset/[category]/model/[tiled
-
+    Where new artifacts for a run should be written:
+    base/dataset/[category]/model/[tiled]/<runKind>/runs/<runId>
 
     Parameters
     ----------
@@ -37,18 +38,27 @@ def resolve_output_dir(
         Name of the category in the dataset the results are fore. Default is `None`
     tiling : bool (optional)
         Is a TiledEnsemble model used? I.e. is there a model for each tile being trained because the images are too large. Default is `True`
+    runKind : str (optional)
+        "training" (train()/eval() -- anything that produces or refines a
+        checkpoint) or "inference" (a predict-only run against an already
+        trained checkpoint, e.g. shift_inspect/product_inference) -- keeps
+        trained-model runs and one-off prediction runs apart on disk instead
+        of mixing them under the same runs/ folder. Default "training".
 
     Returns
     -------
     _name_ : Path
         The path where results are stored
     """
+    if runKind not in ("training", "inference"):
+        raise ValueError(f"runKind must be 'training' or 'inference', got {runKind!r}")
     path = baseOutputDir / datasetName
     if category is not None:
         path = path / category
     path = path / modelName
     if tiling:
         path = path / "tiled"
+    path = path / runKind
     return path / "runs" / runId
 
 def resolve_checkpoint_paths(trainingDir: Path) -> Path:
