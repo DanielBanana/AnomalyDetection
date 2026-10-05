@@ -1515,13 +1515,38 @@ class Product:
         self.tilingConfigPath = tilingConfigPath
 
 def loadProductFromYaml(product_yaml_path: Path, config_dir: Optional[Path] = None, baseOutputDir: Optional[Path] = None) -> Product:
+    with product_yaml_path.open("r", encoding="utf-8") as f:
+        product_config = yaml.safe_load(f)
+
+    return loadProductFromConfig(product_config, product_yaml_path, config_dir=config_dir, baseOutputDir=baseOutputDir)
+
+
+def loadProductFromConfig(product_config: Dict[str, Any], product_yaml_path: Path, config_dir: Optional[Path] = None, baseOutputDir: Optional[Path] = None) -> Product:
+    """
+    Build a Product from an already parsed product description -- the same
+    mapping a configs/Products/*.yaml holds (product, model, tiling, trainer,
+    inferencer, dataset), wherever it came from. loadProductFromYaml reads it
+    from a file; AD_Worker's product_load_catalog builds it from the product's
+    catalog row instead (see core/database.py's products table).
+
+    Parameters
+    ----------
+    product_config : Dict[str, Any]
+        The product description, in the product YAML's layout.
+    product_yaml_path : Path
+        Where the description lives, or would live -- only used as an anchor
+        to resolve relative config/dataset paths against, so the file itself
+        does not have to exist when the description did not come from one.
+    config_dir : Optional[Path]
+        General configuration directory (usually 'configs').
+    baseOutputDir : Optional[Path]
+        Results root, to resolve the 'latest'/'best' run from when the
+        description does not pin model.trainingDir.
+    """
     training_dir: Path | None
     modelName: str | None
     modelConfigFile: str | None
     selection: str
-
-    with product_yaml_path.open("r", encoding="utf-8") as f:
-        product_config = yaml.safe_load(f)
 
     if not isinstance(product_config, dict):
         raise TypeError("product YAML must contain a mapping at the top level")

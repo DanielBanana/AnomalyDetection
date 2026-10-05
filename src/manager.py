@@ -41,7 +41,7 @@ from setup import (
     TrainerConfig,
     ModelConfig,
     TilingPipelineConfig,
-    Product, loadProductFromYaml,
+    Product, loadProductFromYaml, loadProductFromConfig,
     DatasetConfig,
     DatasetSession,
     SetupError,
@@ -572,6 +572,7 @@ class AnomalyDetectionManager:
         trainerConfigPath: Optional[Path],
         tilingConfigPath: Optional[Path],
         inferencerConfigPath: Optional[Path],
+        modelConfig: Optional[ModelConfig] = None,
     ) -> RunConfigFiles:
         """
         The set of config files in use for the run being prepared, anchored
@@ -588,11 +589,18 @@ class AnomalyDetectionManager:
         _name_ : RunConfigFiles
             Config file paths for the run being prepared.
         """
+        # The model config the run is actually being prepared with (passed
+        # in by train()/eval()/inference()), not self.modelConfig: that is
+        # only set by loadModelConfig, never by loading a product, so
+        # relying on it left the pre-/post-processor and evaluator YAMLs
+        # out of every run started from a loaded product -- and a run
+        # without them cannot be loaded again (see loadFromRunDir).
+        modelConfig = modelConfig if modelConfig is not None else self.modelConfig
         preProcessorPath = postProcessorPath = evaluatorPath = None
-        if self.modelConfig is not None:
-            preProcessorPath = self.modelConfig.preProcessorPath
-            postProcessorPath = self.modelConfig.postProcessorPath
-            evaluatorPath = self.modelConfig.evaluatorPath
+        if modelConfig is not None:
+            preProcessorPath = modelConfig.preProcessorPath
+            postProcessorPath = modelConfig.postProcessorPath
+            evaluatorPath = modelConfig.evaluatorPath
 
         return RunConfigFiles(
             configDir=self.configDir,
@@ -625,6 +633,45 @@ class AnomalyDetectionManager:
             A tuple of the created manager class and a product that contains all important information about the product.
         """
         product = loadProductFromYaml(productConfigPath, config_dir=configDir, baseOutputDir=outputPath)
+        return cls._managerForProduct(product, outputPath, configDir), product
+
+    @classmethod
+    def loadProductFromConfig(cls, productConfig: Dict[str, Any], outputPath: Path, configDir: Path) -> Tuple["AnomalyDetectionManager", Product]:
+        """
+        Same as loadProduct, for a product description that is already a
+        mapping (in the product YAML's layout) instead of a file on disk --
+        e.g. one built from the product's catalog row, see AD_Worker's
+        product_load_catalog.
+
+        Parameters
+        ----------
+        productConfig : Dict[str, Any]
+            The product description (product, model, tiling, trainer, inferencer, dataset)
+        outputPath : Path
+            Where the output path of the manager should be
+        configDir : Path
+            Where the configuration files can be found. Usually a dir named 'configs'
+
+        Returns
+        -------
+        _name_ : Tuple[AnomalyDetectionManager, Product]
+            A tuple of the created manager class and the product.
+        """
+        # Where a product YAML of this name would live: only an anchor for
+        # resolving relative paths, the file does not have to exist.
+        anchorPath = Path(configDir) / "Products" / f"{productConfig.get('product')}.yaml"
+        product = loadProductFromConfig(productConfig, anchorPath, config_dir=configDir, baseOutputDir=outputPath)
+        # loadProductFromConfig looks for an earlier run by the model
+        # config's file name when model.name is not given ("padim" for
+        # padim.yaml), runs are filed under the model's real name
+        # ("Padim") -- look again now that the model config is loaded.
+        product.refresh_training_dir(outputPath)
+        return cls._managerForProduct(product, outputPath, configDir), product
+
+    @classmethod
+    def _managerForProduct(cls, product: Product, outputPath: Path, configDir: Path) -> "AnomalyDetectionManager":
+        """The manager for a freshly loaded `product`: model generated,
+        tiling set up, pointed at the product's run (if it has one)."""
         manager = cls(outputDir=outputPath, configDir=configDir)
         manager.generateModel(modelConfig=product.modelConfig)
         manager.setupTiling(product.tilingPipelineConfig)
@@ -640,7 +687,7 @@ class AnomalyDetectionManager:
                 manager.readiness |= ManagerReadiness.CALIBRATED
         manager._apply_visualizer_output_dir(outputPath)
 
-        return manager, product
+        return manager
 
     @classmethod
     def loadFromRunDir(cls, runDir: Path, baseOutputDir: Path) -> Tuple["AnomalyDetectionManager", Product]:
@@ -1024,6 +1071,7 @@ class AnomalyDetectionManager:
         self._runConfigFiles(
             modelConfigPath=modelConfigPath, trainerConfigPath=trainerConfigPath,
             tilingConfigPath=tilingConfigPath, inferencerConfigPath=inferencerConfigPath,
+            modelConfig=modelConfig,
         ).copy_to(ctx.outputDir)
         # raw YAMLs alongside the manifest
         self.ckptDir = resolve_checkpoint_paths(ctx.outputDir)
@@ -1103,6 +1151,7 @@ class AnomalyDetectionManager:
         self._runConfigFiles(
             modelConfigPath=modelConfigPath, trainerConfigPath=trainerConfigPath,
             tilingConfigPath=tilingConfigPath, inferencerConfigPath=inferencerConfigPath,
+            modelConfig=modelConfig,
         ).copy_to(ctx.outputDir)
         copy_checkpoints(self.ckptDir, ctx.outputDir)
         self._evalTiledModel(
@@ -1204,6 +1253,7 @@ class AnomalyDetectionManager:
         self._runConfigFiles(
             modelConfigPath=modelConfigPath, trainerConfigPath=trainerConfigPath,
             tilingConfigPath=tilingConfigPath, inferencerConfigPath=inferencerConfigPath,
+            modelConfig=modelConfig,
         ).copy_to(ctx.outputDir)
         copy_checkpoints(self.ckptDir, ctx.outputDir)
 
