@@ -185,7 +185,10 @@ class MVTecStyleDataImporter(LabeledImageDatasetImporter):
                 continue
             if whitelist is not None and anomalyType not in whitelist:
                 continue
-            if split == "ground_truth":
+            # marked/: objects photographed with their anomaly still
+            # marked by pen -- kept next to the dataset as a record of
+            # where the anomaly is, never trained or tested on.
+            if split in ("ground_truth", "marked"):
                 continue
             if split == "test":
                 # Look for ground truth segmentation masks
