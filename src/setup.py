@@ -1081,7 +1081,17 @@ class TilingPipelineConfig:
         if not isinstance(tiling, dict):
             raise TypeError("tiling config must be a dict")
 
-        seam_smoothing:Optional[Dict[str,Any]] = tiling.get("SeamSmoothing", tiling.get("seam_smoothing", None))
+        # The config files (configs/Tiling/*.yaml) hold the stages and
+        # SeamSmoothing beside "tiling:", a run's manifest holds them inside
+        # it (see to_dict). Both are read; inside wins.
+        def _setting(*keys: str) -> Any:
+            for source in (tiling, config):
+                for key in keys:
+                    if source.get(key) is not None:
+                        return source[key]
+            return None
+
+        seam_smoothing:Optional[Dict[str,Any]] = _setting("SeamSmoothing", "seam_smoothing")
         if seam_smoothing is None:
             Warning("Seem smoothing has not been found in manifest.yaml")
             seam_smoothing = {
@@ -1095,8 +1105,8 @@ class TilingPipelineConfig:
             image_size=cls._parse_tuple(tiling.get("image_size"), "image_size"),
             tile_size=cls._parse_tuple(tiling.get("tile_size"), "tile_size"),
             stride=cls._parse_tuple(tiling.get("stride"), "stride"),
-            normalization_stage=NormalizationStage(cls._parse_enum(NormalizationStage, tiling.get("normalization_stage"), NormalizationStage.IMAGE)),
-            thresholding_stage=ThresholdingStage(cls._parse_enum(ThresholdingStage, tiling.get("thresholding_stage"), ThresholdingStage.IMAGE)),
+            normalization_stage=NormalizationStage(cls._parse_enum(NormalizationStage, _setting("normalization_stage"), NormalizationStage.IMAGE)),
+            thresholding_stage=ThresholdingStage(cls._parse_enum(ThresholdingStage, _setting("thresholding_stage"), ThresholdingStage.IMAGE)),
             seam_smoothing=cls._parse_seam_smoothing(seam_smoothing),
         )
 
