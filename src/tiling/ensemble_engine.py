@@ -114,6 +114,10 @@ def _adjust_gui_progress_callback(callback: GUITrainingProgressCallback, ctx: Ti
     from construction.
     """
     callback.total_tiles = ctx.total_tiles
+    # Which tile, and where its run is: for the Loss chart's tile names and the
+    # tile_metrics.csv written after the last tile (see GUITrainingProgressCallback).
+    callback.tile_index = ctx.tile_index
+    callback.run_dir = ctx.default_root_dir
     return callback
 
 

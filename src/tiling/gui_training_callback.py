@@ -12,14 +12,29 @@ import in this app -- see gui_main.py/cli_main.py's own sys.path setup); GUI.py'
 _onTrainProgress is what consumes it (three progress bars: tiles overall,
 epochs within whichever tile is currently training, and batches within the
 epoch that is running).
+
+It also sends the points of TRAIN AI's Loss chart as "training_metrics"
+updates (GUI.py's _onTrainingMetrics): the mean training loss of every
+epoch, and after every validation the validation loss -- if the model
+computes one; anomalib's models do not -- and the validation image AUROC.
+It keeps every tile's points (self.history), logs after every tile how
+the tiles are doing together -- mean and spread, and the worst tile (see
+core/tile_statistics.py, shared with the GUI) -- and writes all points to
+tile_metrics.csv in the run folder after the last tile.
 """
 
+import csv
+import logging
 import time
-from typing import TYPE_CHECKING, Any, Dict
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from lightning.pytorch.callbacks import Callback
 
 from core.command_dispatcher import post_worker_update
+from core.tile_statistics import summary, summaryLines
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import lightning.pytorch as pl
@@ -65,6 +80,59 @@ class GUITrainingProgressCallback(Callback):
         # When the last per-batch report went out (time.monotonic()), see
         # on_train_batch_end.
         self._lastBatchReport = 0.0
+        # Sum and count of the running epoch's training losses (see
+        # on_train_batch_end), and likewise of the running validation's,
+        # for the per-epoch means _reportMetric sends.
+        self._trainLoss = [0.0, 0]
+        self._valLoss = [0.0, 0]
+        # Grid position (row, column) of the tile that is training, and the run
+        # folder -- set per tile by ensemble_engine.py's _adjust_gui_progress_callback;
+        # None in a non-tiled run.
+        self.tile_index: Optional[Tuple[int, int]] = None
+        self.run_dir: Optional[Path] = None
+        # Every point reported so far, by tile number (from 1, in training order):
+        # {"position": tile_index, "points": {name: {epoch: value}}} -- the history
+        # core/tile_statistics.py summarizes.
+        self.history: Dict[int, Dict[str, Any]] = {}
+
+    # Update kind of the loss/validation curve values, beside "progress";
+    # GUI.py's _onTrainingMetrics draws them.
+    METRICS_KIND = "training_metrics"
+    # What validation measures when the model computes no validation loss
+    # (anomalib's models only score the validation images): the metric
+    # EarlyStopping and ModelCheckpoint watch in Training_InpFormer.yaml.
+    VALIDATION_METRIC = "image_AUROC"
+
+    @staticmethod
+    def _scalarOf(outputs: Any) -> "float | None":
+        """A single number from a tensor, or from a dict's "loss" (what a
+        training/validation step returns by Lightning's convention); None
+        for anything else, e.g. anomalib's validation steps, which return
+        predictions."""
+        loss = outputs.get("loss") if isinstance(outputs, dict) else outputs
+        if loss is None or not hasattr(loss, "detach"):
+            return None
+        try:
+            return float(loss.detach())
+        except (TypeError, ValueError, RuntimeError):     # not a single value
+            return None
+
+    def _reportMetric(self, trainer: "pl.Trainer", name: str, value: float) -> None:
+        """One point of a curve: `name` ("train_loss", "val_loss" or
+        VALIDATION_METRIC) after epoch trainer.current_epoch + 1 of the
+        tile that is training."""
+        tile = min(self.tiles_completed + 1, self.total_tiles)
+        epoch = trainer.current_epoch + 1
+        record = self.history.setdefault(tile, {"position": self.tile_index, "points": {}})
+        record["points"].setdefault(name, {})[epoch] = value
+        post_worker_update(self.METRICS_KIND, {
+            "tile": tile,
+            "total_tiles": self.total_tiles,
+            "position": list(self.tile_index) if self.tile_index is not None else None,
+            "epoch": epoch,
+            "name": name,
+            "value": value,
+        })
 
     # At most this many per-batch reports a second: an epoch of many fast
     # batches would otherwise fill the GUI's update queue faster than it
@@ -87,6 +155,10 @@ class GUITrainingProgressCallback(Callback):
         done also counts towards the tile's (and so the overall) progress,
         so those bars move during a long epoch instead of standing still
         until it ends."""
+        loss = self._scalarOf(outputs)
+        if loss is not None:
+            self._trainLoss[0] += loss
+            self._trainLoss[1] += 1
         total = self._totalBatches(trainer)
         done = batch_idx + 1
         now = time.monotonic()
@@ -105,6 +177,40 @@ class GUITrainingProgressCallback(Callback):
         max_epochs = trainer.max_epochs or 1
         tile_progress = min((trainer.current_epoch + 1) / max_epochs, 1.0)
         self._report(trainer, tile_progress=tile_progress, batch=self._totalBatches(trainer))
+        total, count = self._trainLoss
+        if count:
+            self._reportMetric(trainer, "train_loss", total / count)
+        self._trainLoss = [0.0, 0]
+
+    def on_validation_epoch_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        self._valLoss = [0.0, 0]
+
+    def on_validation_batch_end(
+        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", outputs: Any, batch: Any, batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        loss = self._scalarOf(outputs)
+        if loss is not None:
+            self._valLoss[0] += loss
+            self._valLoss[1] += 1
+
+    def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        """After a validation (not Lightning's sanity check): the mean
+        validation loss if the model's steps returned one, else a logged
+        "val_loss", and VALIDATION_METRIC if it was logged. Read here, not
+        in on_validation_epoch_end, because Lightning has filled
+        trainer.callback_metrics by now (ModelCheckpoint relies on the
+        same)."""
+        if getattr(trainer, "sanity_checking", False):
+            return
+        metrics = getattr(trainer, "callback_metrics", None) or {}
+        total, count = self._valLoss
+        valLoss = total / count if count else self._scalarOf(metrics.get("val_loss"))
+        if valLoss is not None:
+            self._reportMetric(trainer, "val_loss", valLoss)
+        value = self._scalarOf(metrics.get(self.VALIDATION_METRIC))
+        if value is not None:
+            self._reportMetric(trainer, self.VALIDATION_METRIC, value)
 
     def on_fit_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         """Reached max_epochs or EarlyStopping cut it short -- either way
@@ -120,6 +226,32 @@ class GUITrainingProgressCallback(Callback):
         """
         self._report(trainer, tile_progress=1.0, batch=self._totalBatches(trainer))
         self.tiles_completed = min(self.tiles_completed + 1, self.total_tiles)
+        for line in summaryLines(summary(self.history), totalTiles=self.total_tiles):
+            logger.info(f"Tiles after {self.tiles_completed} of {self.total_tiles}: {line}")
+        if self.tiles_completed == self.total_tiles:
+            self._writeTileMetrics()
+
+    def _writeTileMetrics(self) -> None:
+        """All points of all tiles as <run folder>/tile_metrics.csv (tile, row,
+        column, epoch, name, value), so the chart can be redrawn after the run.
+        Skipped without a run folder; a failed write is logged, not raised -- the
+        trained models matter more than this file."""
+        if self.run_dir is None or not self.history:
+            return
+        path = Path(self.run_dir) / "tile_metrics.csv"
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["tile", "row", "column", "epoch", "name", "value"])
+                for tile, record in sorted(self.history.items()):
+                    row, column = record["position"] if record["position"] is not None else ("", "")
+                    for name, points in record["points"].items():
+                        for epoch, value in sorted(points.items()):
+                            writer.writerow([tile, row, column, epoch, name, value])
+        except OSError as e:
+            logger.warning(f"Could not write {path}: {e}")
+            return
+        logger.info(f"Loss and validation values of every tile written to {path}.")
 
     def _report(self, trainer: "pl.Trainer", tile_progress: float, batch: int) -> None:
         """`batch` is how many batches of the running epoch are done;
