@@ -554,7 +554,9 @@ def best_run(
 ) -> Optional[RunSummary]:
     """Convenience wrapper around list_runs: the best complete run for a
     product/category by a given metric. Returns None if no complete run has
-    that metric recorded.
+    that metric recorded. Of runs with the same value (common for AUROC,
+    which is often 1.0), the newest wins: list_runs returns newest first and
+    max()/min() keep the first of equal values.
     """
     candidates = [
         r for r in list_runs(baseOutputDir, productName=productName, modelName=modelName, onlyComplete=True)
@@ -567,7 +569,10 @@ def best_run(
     return max(candidates, key=key) if mode == "max" else min(candidates, key=key)
 
 
-DEFAULT_BEST_METRIC = "image_F1Score"
+# What "best" means when a product's run is chosen by model_selection "best": image
+# AUROC, which does not depend on a threshold, so it compares the models themselves;
+# the threshold is calibration's separate choice. (image_F1Score until 2026-10-14.)
+DEFAULT_BEST_METRIC = "image_AUROC"
 
 
 def resolve_run_dir(
