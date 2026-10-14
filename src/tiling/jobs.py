@@ -403,6 +403,20 @@ class PredictionMergingMechanism:
 
         return {"pred_label": labels, "pred_score": scores}
 
+    @staticmethod
+    def merge_gt_labels(batch_data: dict) -> Any:
+        """The image's ground-truth label from its tiles' labels: anomalous if any
+        tile is. Each tile is labelled by its own part of the mask (TileCollater in
+        ensemble_tiling.py), so tile (0, 0) alone no longer tells; "any tile" gives
+        back exactly the image's label. None if the tiles carry no label."""
+        labels = [tile.gt_label for tile in batch_data.values() if getattr(tile, "gt_label", None) is not None]
+        if not labels:
+            return None
+        merged = labels[0].bool()
+        for label in labels[1:]:
+            merged = merged.logical_or(label.bool())
+        return merged.to(labels[0].dtype)
+
     def merge_tile_predictions(self, batch_index: int) -> ImageBatch:
         """Join predictions from ensemble into whole image level representation for batch at index batch_index.
 
@@ -415,10 +429,10 @@ class PredictionMergingMechanism:
         current_batch_data = self.ensemble_predictions.get_batch_tiles(batch_index)
 
         # take first tile as base prediction, keep items that are the same over all tiles:
-        # image_path, label, mask_path
+        # image_path, mask_path
         merged_predictions = {
             "image_path": current_batch_data[0, 0].image_path,
-            "gt_label": current_batch_data[0, 0].gt_label,
+            "gt_label": self.merge_gt_labels(current_batch_data),
         }
         if hasattr(current_batch_data[0, 0], "mask_path"):
             merged_predictions["mask_path"] = current_batch_data[0, 0].mask_path

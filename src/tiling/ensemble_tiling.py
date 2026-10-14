@@ -154,7 +154,26 @@ class TileCollater:
         coll_batch.image = self._crop_tile(coll_batch.image, self.tile_index)
 
         if hasattr(coll_batch, "gt_mask") and coll_batch.gt_mask is not None:
-            mask = coll_batch.gt_mask.unsqueeze(1)
+            full_mask = coll_batch.gt_mask
+            mask = full_mask.unsqueeze(1)
             coll_batch.gt_mask = self._crop_tile(mask, self.tile_index).squeeze(1)
+            if getattr(coll_batch, "gt_label", None) is not None:
+                coll_batch.gt_label = self._tile_labels(coll_batch.gt_label, full_mask, coll_batch.gt_mask)
 
         return coll_batch
+
+    @staticmethod
+    def _tile_labels(image_labels: "Tensor", full_mask: "Tensor", tile_mask: "Tensor") -> "Tensor":
+        """The label of this tile of every image: anomalous only if the image's
+        ground-truth mask marks something inside the tile. Without that, a tile
+        showing nothing but good surface would count as anomalous whenever the
+        defect is elsewhere in the image, and each tile model's validation (image
+        AUROC, which EarlyStopping/ModelCheckpoint watch, and its thresholds)
+        would score it against a label it cannot see. Images whose mask marks
+        nothing (good images, or anomalous ones without a drawn mask) keep the
+        image's label. AOIMergeJob (jobs.py) recovers the image label as "any
+        tile anomalous"."""
+        has_mask = full_mask.flatten(1).any(dim=1)
+        in_tile = tile_mask.flatten(1).any(dim=1)
+        labels = image_labels.bool().where(~has_mask, in_tile)
+        return labels.to(image_labels.dtype)
