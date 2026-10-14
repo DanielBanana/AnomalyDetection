@@ -654,12 +654,28 @@ class DatasetConfig:
 
         return DatasetConfig(name=name, category=category, splits=tuple(splits), path=dataset_path)
 
+def _share(value: Any, name: str) -> Optional[float]:
+    """A config value that is a share of something: a number above 0 and at most 1,
+    or None if it is not set. Raises ValueError otherwise, naming the setting."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+        raise ValueError(f"{name} must be a share above 0 and at most 1 (e.g. 0.125 for 1/8), not {value!r}.")
+    return float(value)
+
 @dataclass
 class DataModuleConfig:
     val_split_mode: ValSplitMode
     test_split_mode: TestSplitMode
     train_batch_size: Optional[int | str] = None  # int, or "auto" to probe the largest batch size that fits in GPU memory
     eval_batch_size: Optional[int | str] = None  # int, or "auto" (see train_batch_size)
+    # Upper limit of an "auto" train_batch_size, as a share of the training images:
+    # 0.125 allows at most 1/8 of them per batch, so every epoch has at least about 8
+    # optimizer steps (the probe alone would pick the largest batch that fits in GPU
+    # memory, which on a small dataset leaves only one or two steps per epoch). None
+    # means DEFAULT_MAX_TRAIN_BATCH_SHARE in tiling/tiled_ensemble.py. Not a datamodule
+    # argument: to_dict() leaves it out.
+    max_train_batch_size: Optional[float] = None
     train_augmentations: Optional[List[Any]] = None
     val_augmentations: Optional[List[Any]] = None
     test_augmentations: Optional[List[Any]] = None
@@ -669,10 +685,14 @@ class DataModuleConfig:
     seed: Optional[int] = None
     num_workers: Optional[int] = None
 
+    # Fields read from the same YAML that are not FODataModule arguments (to_dict()'s
+    # result is passed to it as keyword arguments).
+    _NOT_DATAMODULE_ARGUMENTS = ("max_train_batch_size",)
+
     def to_dict(self) -> Dict[str, Any]:
         d:Dict[str,Any] = {}
         for k,v in asdict(self).items():
-            if v is None:
+            if v is None or k in self._NOT_DATAMODULE_ARGUMENTS:
                 continue
             if isinstance(v,Enum):
                 d[k] = v.value
@@ -686,6 +706,7 @@ class DataModuleConfig:
         return cls(
             train_batch_size=config.get("train_batch_size"),
             eval_batch_size=config.get("eval_batch_size"),
+            max_train_batch_size=_share(config.get("max_train_batch_size"), "max_train_batch_size"),
             train_augmentations=config.get("train_augmentations"),
             val_augmentations=config.get("val_augmentations"),
             test_augmentations=config.get("test_augmentations"),

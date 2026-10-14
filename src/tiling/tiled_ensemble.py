@@ -106,9 +106,27 @@ def _pipeline_trainer_kwargs(trainerConfig: TrainerConfig) -> Dict[str, Any]:
 
 
 # Cache of probed batch sizes, keyed by (accelerator, model class, tile shape, which
-# batch-size arg). All tiles in an ensemble share the same tile shape, so probing once
-# per unique key instead of once per tile avoids repeating the (slow) OOM search.
+# batch-size arg, upper limit). All tiles in an ensemble share the same tile shape, so
+# probing once per unique key instead of once per tile avoids repeating the (slow) OOM
+# search.
 _BATCH_SIZE_PROBE_CACHE: dict[tuple[Any, ...], int] = {}
+
+# Batch size used when the probe itself fails: small, so that it also fits the large
+# tiles of the line camera's images, not only the 256 px tiles of MVTec.
+PROBE_FALLBACK_BATCH_SIZE = 4
+# Largest batch size the probe tries at all.
+PROBE_MAX_BATCH_SIZE = 64
+# Default of a trainer config's max_train_batch_size (see DataModuleConfig in setup.py).
+DEFAULT_MAX_TRAIN_BATCH_SHARE = 0.125
+
+
+def max_train_batch_size(n_train_images: int, share: float | None) -> int:
+    """Upper limit of a probed ("auto") training batch size: `share` of the training
+    images (DEFAULT_MAX_TRAIN_BATCH_SHARE if None), at least 1, at most
+    PROBE_MAX_BATCH_SIZE. Every tile model sees every training image once per epoch,
+    so this keeps at least about 1/share optimizer steps per epoch."""
+    share = DEFAULT_MAX_TRAIN_BATCH_SHARE if share is None else share
+    return max(1, min(PROBE_MAX_BATCH_SIZE, int(n_train_images * share)))
 
 
 @contextlib.contextmanager
@@ -119,12 +137,18 @@ def _trust_own_checkpoints():
     objects (e.g. anomalib's ``PreProcessor``) bundled in a full Lightning checkpoint.
     Only use this around loads of checkpoints we wrote ourselves moments earlier in
     this same process - never around loading a checkpoint of unknown/external origin.
+
+    Overrides ``weights_only`` even when the caller passes it: Lightning's
+    checkpoint restore calls ``torch.load(..., weights_only=None)`` explicitly, and
+    None means torch's strict default. Neither ``kwargs.setdefault`` nor a
+    ``functools.partial`` default (what this used to do) gets past an explicit
+    argument, so the probe's restore kept failing.
     """
     original_load = torch.load
 
     @functools.wraps(original_load)
     def patched_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
+        kwargs["weights_only"] = False
         return original_load(*args, **kwargs)
 
     torch.load = patched_load
@@ -132,15 +156,6 @@ def _trust_own_checkpoints():
         yield
     finally:
         torch.load = original_load
-
-@contextlib.contextmanager
-def weights_only_false():
-    original = torch.load
-    torch.load = functools.partial(torch.load, weights_only=False)
-    try:
-        yield
-    finally:
-        torch.load = original
 
 
 def probe_optimal_batch_size(
@@ -150,7 +165,7 @@ def probe_optimal_batch_size(
     root_dir: Path,
     batch_arg_name: str,
     method: Literal["fit", "validate", "test", "predict"],
-    max_val: int = 64,
+    max_val: int = PROBE_MAX_BATCH_SIZE,
 ) -> int:
     """Empirically find the largest batch size that fits in memory via binary search.
 
@@ -176,7 +191,8 @@ def probe_optimal_batch_size(
             for gradient-trained models), and "validate"/"test" for eval_batch_size
             (matches whichever split predict will actually run on).
         max_val: Upper bound on the search, to avoid testing unrealistically large
-            batch sizes.
+            batch sizes. For training see max_train_batch_size. Below 2 there is
+            nothing to search: max_val itself is returned.
 
     Returns:
         int: Largest batch size found to fit in memory (>= 1).
@@ -188,14 +204,18 @@ def probe_optimal_batch_size(
         tuple(input_size) if input_size is not None else None,
         batch_arg_name,
         method,
+        max_val,
     )
     if cache_key in _BATCH_SIZE_PROBE_CACHE:
         return _BATCH_SIZE_PROBE_CACHE[cache_key]
+    if max_val < 2:
+        return max(1, max_val)
 
     if accelerator != "cuda":
-        logger.info(f"Batch size probing skipped on accelerator '{accelerator}'; using conservative default of 8.")
-        _BATCH_SIZE_PROBE_CACHE[cache_key] = 8
-        return 8
+        fallback = min(8, max_val)
+        logger.info(f"Batch size probing skipped on accelerator '{accelerator}'; using conservative default of {fallback}.")
+        _BATCH_SIZE_PROBE_CACHE[cache_key] = fallback
+        return fallback
 
     from copy import deepcopy
     from lightning.pytorch import Trainer as PLTrainer
@@ -224,7 +244,7 @@ def probe_optimal_batch_size(
         # `weights_only=True` default refuses to unpickle. The checkpoint is one we wrote
         # ourselves a few lines above, in this same process, so trusting it here (unlike an
         # arbitrary external checkpoint) is safe - relax just this restore accordingly.
-        with weights_only_false():
+        with _trust_own_checkpoints():
             optimal = tuner.scale_batch_size(
                 probe_model,
                 datamodule=datamodule,
@@ -238,15 +258,15 @@ def probe_optimal_batch_size(
                 max_val=max_val,    
             )
     except Exception:
-        logger.exception(f"Batch size probe for '{batch_arg_name}' failed; falling back to 1.")
-        optimal = 14
+        optimal = min(PROBE_FALLBACK_BATCH_SIZE, max_val)
+        logger.exception(f"Batch size probe for '{batch_arg_name}' failed; falling back to {optimal}.")
     finally:
         del probe_model, probe_trainer, tuner
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    optimal = max(1, optimal or 1)
-    logger.info(f"Batch size probe: {batch_arg_name} ({method}) -> {optimal}")
+    optimal = max(1, min(optimal or 1, max_val))
+    logger.info(f"Batch size probe: {batch_arg_name} ({method}, at most {max_val}) -> {optimal}")
     _BATCH_SIZE_PROBE_CACHE[cache_key] = optimal
     return optimal
 
@@ -1027,6 +1047,9 @@ class TrainModelJobGenerator(JobGenerator):
                     root_dir=self.root_dir,
                     batch_arg_name="train_batch_size",
                     method="fit",
+                    max_val=max_train_batch_size(
+                        len(datamodule.train_data), self.dataModuleConfig.max_train_batch_size,
+                    ),
                 )
 
             # pass root_dir to engine so all models in ensemble have the same root dir
