@@ -547,8 +547,11 @@ class EvalTiledEnsemble(Pipeline):
                         inferenceJobGenerator,
                     ),
                 )
-            # 2. merge predictions
-            runners.append(SerialRunner(AOIMergeJobGenerator(tilingPipelineConfig=self.tilingPipelineConfig)))
+            # 2. merge predictions; the validation run fits the tile scaling of the
+            # max merge into statsDir, the test run reads it (see score_merge.py)
+            runners.append(SerialRunner(AOIMergeJobGenerator(
+                tilingPipelineConfig=self.tilingPipelineConfig, scaling_dir=statsDir, fit_scaling=(mode == Split.VAL),
+            )))
 
             # 3. (optional) smooth seams
             if self.tilingPipelineConfig.seam_smoothing.apply:
@@ -560,7 +563,11 @@ class EvalTiledEnsemble(Pipeline):
 
             if mode == Split.VAL:
                 # 5. calculate statistics used for inference
-                runners.append(SerialRunner(AOIStatisticsJobGenerator(statsDir)))
+                runners.append(SerialRunner(AOIStatisticsJobGenerator(
+                    statsDir,
+                    image_threshold=self.tilingPipelineConfig.image_threshold,
+                    max_miss_rate=self.tilingPipelineConfig.max_miss_rate,
+                )))
 
             # 4. (optional) normalize
             if normalization_stage == NormalizationStage.IMAGE:
@@ -762,8 +769,11 @@ class InferenceTiledEnsemble(Pipeline):
                     inferenceJobGenerator,
                 ),
             )
-        # 2. merge predictions
-        runners.append(SerialRunner(AOIMergeJobGenerator(tilingPipelineConfig=self.tilingPipelineConfig)))
+        # 2. merge predictions, the way the model was calibrated (tile_scaling.json
+        # next to stats.json in trainingDir, see score_merge.py)
+        runners.append(SerialRunner(AOIMergeJobGenerator(
+            tilingPipelineConfig=self.tilingPipelineConfig, scaling_dir=self.trainingDir, fit_scaling=False,
+        )))
 
         # 3. (optional) smooth seams
         if self.tilingPipelineConfig.seam_smoothing.apply:

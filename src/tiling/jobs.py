@@ -17,7 +17,7 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import Any, cast
 from tqdm import tqdm
-from typing import Any, Tuple, Dict, List
+from typing import Any, Tuple, Dict, List, Optional
 from torch import Tensor, nn
 from torchvision.tv_tensors import Image
 from torchvision.transforms.v2 import Compose, Resize, Transform
@@ -50,6 +50,10 @@ from anomalib.pipelines.components import Job, JobGenerator
 from anomalib.pipelines.types import GATHERED_RESULTS, RUN_RESULTS, PREV_STAGE_RESULT
 from anomalib.models.components import AnomalibModule
 from anomalib.utils.normalization.min_max import normalize
+from tiling.score_merge import (
+    MERGE_MAX, MERGE_MEAN, THRESHOLD_F1, THRESHOLD_MISS_RATE,
+    fit_tile_scaling, load_tile_scaling, merge_scores, miss_rate_threshold, save_tile_scaling,
+)
 
 # OWN CODE
 from data.anomaly_datasets import FODataModule
@@ -76,9 +80,16 @@ class AOIStatisticsJob(Job):
 
     name = "Statistics"
 
-    def __init__(self, prev_stage_result: List[ImageBatch], root_dir: Path) -> None:
+    def __init__(
+        self, prev_stage_result: List[ImageBatch], root_dir: Path,
+        image_threshold: str = THRESHOLD_F1, max_miss_rate: float = 0.02,
+    ) -> None:
         self.predictions = prev_stage_result
         self.root_dir = root_dir
+        # How the image threshold is chosen (tiling config image_threshold /
+        # max_miss_rate, see tiling/score_merge.py).
+        self.image_threshold = image_threshold
+        self.max_miss_rate = max_miss_rate
 
     def run(self, task_id: int | None = None) -> Tuple[List[ImageBatch], Dict[str,Any]]:
         """Run job that calculates statistics needed in post-processing steps.
@@ -103,6 +114,24 @@ class AOIStatisticsJob(Job):
 
         post_processor.on_validation_epoch_end(trainer=Trainer(), pl_module=LightningModule(),)
 
+        f1_threshold = post_processor.image_threshold.item()
+        image_threshold, method = f1_threshold, THRESHOLD_F1
+        if self.image_threshold == THRESHOLD_MISS_RATE:
+            scores = torch.cat([torch.as_tensor(batch.pred_score).flatten().cpu() for batch in self.predictions])
+            labels = torch.cat([torch.as_tensor(batch.gt_label).flatten().cpu() for batch in self.predictions])
+            chosen = miss_rate_threshold(scores, labels, self.max_miss_rate)
+            if chosen is None:
+                logger.warning("No defective validation image, so no threshold for a miss rate can be chosen; the F1 threshold is used.")
+            else:
+                image_threshold, method = chosen, THRESHOLD_MISS_RATE
+                missed = int(((scores < chosen) & labels.bool()).sum())
+                alarms = int(((scores >= chosen) & ~labels.bool()).sum())
+                logger.info(
+                    f"Image threshold for at most {self.max_miss_rate:.1%} missed defects: {chosen:.6f} "
+                    f"(F1 threshold {f1_threshold:.6f}); on validation {missed} of {int(labels.sum())} defects "
+                    f"missed, {alarms} of {int((~labels.bool()).sum())} good images flagged."
+                )
+
         # return stats with save path that is later used to save statistics.
         return self.predictions, {
             "minmax": {
@@ -115,8 +144,12 @@ class AOIStatisticsJob(Job):
                     "max": post_processor.pixel_max.item(),
                 },
             },
-            "image_threshold": post_processor.image_threshold.item(),
+            "image_threshold": image_threshold,
             "pixel_threshold": post_processor.pixel_threshold.item(),
+            # How image_threshold was chosen, and the F1 one for comparison.
+            "image_threshold_method": method,
+            "max_miss_rate": self.max_miss_rate,
+            "image_threshold_f1": f1_threshold,
             "save_path": (self.root_dir / "stats.json"),
         }
     
@@ -155,8 +188,12 @@ class AOIStatisticsJobGenerator(JobGenerator):
     def __init__(
         self,
         root_dir: Path,
+        image_threshold: str = THRESHOLD_F1,
+        max_miss_rate: float = 0.02,
     ) -> None:
         self.root_dir = root_dir
+        self.image_threshold = image_threshold
+        self.max_miss_rate = max_miss_rate
 
     @property
     def job_class(self) -> type:
@@ -182,6 +219,8 @@ class AOIStatisticsJobGenerator(JobGenerator):
         yield AOIStatisticsJob(
             prev_stage_result=prev_stage_result,
             root_dir=self.root_dir,
+            image_threshold=self.image_threshold,
+            max_miss_rate=self.max_miss_rate,
         )
 
 
@@ -201,10 +240,19 @@ class AOIMergeJob(Job):
 
     name = "Merge"
 
-    def __init__(self, predictions: EnsemblePredictions, tiler: EnsembleTiler) -> None:
+    def __init__(
+        self, predictions: EnsemblePredictions, tiler: EnsembleTiler,
+        score_merge: str = MERGE_MEAN, scaling_dir: Optional[Path] = None, fit_scaling: bool = False,
+    ) -> None:
         super().__init__()
         self.predictions = predictions
         self.tiler = tiler
+        # The configured merge (tiling config score_merge), where the tile scaling
+        # lives, and whether this run fits it (the validation run of a
+        # calibration) or reads it (test runs, inspection) -- see score_merge.py.
+        self.score_merge = score_merge
+        self.scaling_dir = scaling_dir
+        self.fit_scaling = fit_scaling
 
     def run(self, task_id: int | None = None) -> List[ImageBatch]:
         """Run merging job that merges all batches of tile-level predictions into image-level predictions.
@@ -218,7 +266,23 @@ class AOIMergeJob(Job):
         del task_id  # not needed here
         logger.info("Starting merging job to combine tile results.")
 
-        merger = PredictionMergingMechanism(self.predictions, self.tiler)
+        if self.fit_scaling:
+            # Calibration: fit the scaling on these validation predictions and
+            # record the merge, so that test runs and inspection use the same.
+            score_merge = self.score_merge
+            scaling = fit_tile_scaling(self.predictions.all_data) if score_merge == MERGE_MAX else {}
+            if self.scaling_dir is not None:
+                path = save_tile_scaling(self.scaling_dir, score_merge, scaling)
+                logger.info(f"Image score = {score_merge} of the tile scores; tile scaling saved to {path}.")
+        else:
+            score_merge, scaling = load_tile_scaling(self.scaling_dir)
+            if score_merge != self.score_merge:
+                logger.warning(
+                    f"The tiling config asks for the {self.score_merge} merge, but this model was calibrated with "
+                    f"the {score_merge} merge, which its threshold belongs to; {score_merge} is used. Calibrate "
+                    f"again to use {self.score_merge}."
+                )
+        merger = PredictionMergingMechanism(self.predictions, self.tiler, score_merge=score_merge, scaling=scaling)
         merged_predictions:List[ImageBatch] = [
             merger.merge_tile_predictions(batch_idx)
             for batch_idx in tqdm(range(merger.num_batches), desc="Prediction merging")
@@ -246,9 +310,17 @@ class AOIMergeJob(Job):
 class AOIMergeJobGenerator(JobGenerator):
     """Generate MergeJob."""
 
-    def __init__(self, tilingPipelineConfig: TilingPipelineConfig) -> None:
+    def __init__(
+        self, tilingPipelineConfig: TilingPipelineConfig,
+        scaling_dir: Optional[Path] = None, fit_scaling: bool = False,
+    ) -> None:
+        """scaling_dir: where tile_scaling.json is (stats.json's folder);
+        fit_scaling: fit and save it (a calibration's validation run) instead
+        of reading it -- see AOIMergeJob."""
         super().__init__()
         self.tilingPipelineConfig = tilingPipelineConfig
+        self.scaling_dir = scaling_dir
+        self.fit_scaling = fit_scaling
 
     @property
     def job_class(self) -> type:
@@ -273,7 +345,11 @@ class AOIMergeJobGenerator(JobGenerator):
 
         tiler = get_ensemble_tiler(self.tilingPipelineConfig.to_dict())
         if prev_stage_result is not None:
-            yield AOIMergeJob(prev_stage_result, tiler)
+            yield AOIMergeJob(
+                prev_stage_result, tiler,
+                score_merge=getattr(self.tilingPipelineConfig, "score_merge", MERGE_MEAN),
+                scaling_dir=self.scaling_dir, fit_scaling=self.fit_scaling,
+            )
         else:
             msg = "Merging job requires tile level predictions from previous step."
             raise ValueError(msg)
@@ -289,7 +365,8 @@ class PredictionMergingMechanism:
     Tiles are stacked in one tensor and untiled using Ensemble Tiler.
     Boxes from tiles are either stacked or generated anew from anomaly map.
     Labels are combined with OR operator, meaning one anomalous tile -> anomalous image.
-    Scores are averaged across all tiles.
+    Scores are the highest scaled tile score ("max") or averaged across all tiles
+    ("mean"), see tiling/score_merge.py.
 
     Args:
         ensemble_predictions (EnsemblePredictions): Object containing predictions on tile level.
@@ -307,7 +384,10 @@ class PredictionMergingMechanism:
         >>> merger.merge_tile_predictions(0)
     """
 
-    def __init__(self, ensemble_predictions: EnsemblePredictions, tiler: EnsembleTiler) -> None:
+    def __init__(
+        self, ensemble_predictions: EnsemblePredictions, tiler: EnsembleTiler,
+        score_merge: str = MERGE_MEAN, scaling: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> None:
         assert ensemble_predictions.num_batches > 0, "There should be at least one batch for each tile prediction."
         assert (0, 0) in ensemble_predictions.get_batch_tiles(
             0,
@@ -317,6 +397,8 @@ class PredictionMergingMechanism:
         self.num_batches = self.ensemble_predictions.num_batches
 
         self.tiler = tiler
+        self.score_merge = score_merge
+        self.scaling = scaling or {}
 
     def merge_tiles(self, batch_data: dict, tile_key: str) -> Tensor:
         """Merge tiles back into one tensor and perform untiling with tiler.
@@ -390,16 +472,11 @@ class PredictionMergingMechanism:
         """
         # create accumulator with same shape as original
         labels = torch.zeros(batch_data[0, 0].pred_label.shape, dtype=torch.bool)
-        scores = torch.zeros(batch_data[0, 0].pred_score.shape)
-
         for curr_tile_data in batch_data.values():
-            curr_labels = curr_tile_data.pred_label
-            curr_scores = curr_tile_data.pred_score
+            labels = labels.logical_or(curr_tile_data.pred_label)
 
-            labels = labels.logical_or(curr_labels)
-            scores += curr_scores
-
-        scores /= self.tiler.num_tiles
+        scores = merge_scores(batch_data, self.score_merge, self.scaling)
+        scores = scores.reshape(batch_data[0, 0].pred_score.shape).to(torch.as_tensor(batch_data[0, 0].pred_score).dtype)
 
         return {"pred_label": labels, "pred_score": scores}
 

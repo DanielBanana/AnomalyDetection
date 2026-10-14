@@ -77,6 +77,13 @@ class AOIPostProcessor(PostProcessor):
         self.pixel_sensitivity = pixel_sensitivity
 
         # initialize threshold and normalization metrics
+        # A tile model's own threshold: the one with the best F1 on its validation
+        # crops. With thresholding_stage: image (the configs' setting) the image
+        # verdict does not use it; the image threshold is chosen by AOIStatisticsJob
+        # (jobs.py) on the merged image scores, by F1 or for a target miss rate
+        # (tiling config image_threshold / max_miss_rate, see score_merge.py).
+        # Planned, not built: a cost-weighted threshold (cost of a missed defect
+        # against a false alarm).
         self._image_threshold_metric = F1AdaptiveThreshold(fields=["pred_score", "gt_label"], strict=False)
         if self.gt_mask:
             self._pixel_threshold_metric = F1AdaptiveThreshold(fields=["anomaly_map", "gt_mask"], strict=False)

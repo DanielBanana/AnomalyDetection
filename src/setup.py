@@ -1034,6 +1034,16 @@ class TilingPipelineConfig:
     root_dir:Optional[Path] = None
     normalization_stage: NormalizationStage = NormalizationStage.IMAGE
     thresholding_stage: ThresholdingStage = ThresholdingStage.IMAGE
+    # How tile scores become the image score, and how the image threshold is
+    # chosen at calibration -- see tiling/score_merge.py and
+    # documentation/source/decisions/tile_score_merge.rst. "max": each tile scaled
+    # by the good validation images of its position, then the highest; "mean": the
+    # mean of the tile scores (before 2026-10-14).
+    score_merge: str = "max"
+    # "f1": best F1 on the validation images; "miss_rate": at most max_miss_rate of
+    # the defective validation images below the threshold.
+    image_threshold: str = "f1"
+    max_miss_rate: float = 0.02
 
     def to_dict(self) -> Dict[str, Any]:
         d:Dict[str,Any] = {}
@@ -1055,7 +1065,10 @@ class TilingPipelineConfig:
             f"  seam_smoothing={self.seam_smoothing}\n"
             f"  root_dir={self.root_dir}\n"
             f"  normalization_stage={self.normalization_stage}\n"
-            f"  thresholding_stage={self.thresholding_stage}"
+            f"  thresholding_stage={self.thresholding_stage}\n"
+            f"  score_merge={self.score_merge}\n"
+            f"  image_threshold={self.image_threshold}\n"
+            f"  max_miss_rate={self.max_miss_rate}"
         )
 
     def __repr__(self) -> str:
@@ -1079,6 +1092,25 @@ class TilingPipelineConfig:
         if isinstance(value, (List, Tuple)):
             return (int(value[0]), int(value[1]))
         raise ValueError(f"{name} must be a tuple/list of length 2. Got {value}")
+
+    @classmethod
+    def _parse_choice(cls, value: Any, name: str, choices: Tuple[str, ...], default: str) -> str:
+        """One of `choices` (default if not set); ValueError naming the setting otherwise."""
+        if value is None:
+            return default
+        if value not in choices:
+            raise ValueError(f"{name} must be one of {', '.join(choices)}, not {value!r}.")
+        return value
+
+    @classmethod
+    def _parse_miss_rate(cls, value: Any) -> float:
+        """max_miss_rate: a share from 0 (no defect may be missed) up to, not
+        including, 1; 0.02 if not set."""
+        if value is None:
+            return 0.02
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1:
+            raise ValueError(f"max_miss_rate must be a share from 0 up to 1 (e.g. 0.02 for 2 %), not {value!r}.")
+        return float(value)
 
     @classmethod
     def _parse_seam_smoothing(cls, value: Any) -> SeamSmoothingConfig:
@@ -1129,6 +1161,9 @@ class TilingPipelineConfig:
             normalization_stage=NormalizationStage(cls._parse_enum(NormalizationStage, _setting("normalization_stage"), NormalizationStage.IMAGE)),
             thresholding_stage=ThresholdingStage(cls._parse_enum(ThresholdingStage, _setting("thresholding_stage"), ThresholdingStage.IMAGE)),
             seam_smoothing=cls._parse_seam_smoothing(seam_smoothing),
+            score_merge=cls._parse_choice(_setting("score_merge"), "score_merge", ("max", "mean"), "max"),
+            image_threshold=cls._parse_choice(_setting("image_threshold"), "image_threshold", ("f1", "miss_rate"), "f1"),
+            max_miss_rate=cls._parse_miss_rate(_setting("max_miss_rate")),
         )
 
     @classmethod
