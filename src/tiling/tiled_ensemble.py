@@ -1322,6 +1322,7 @@ class InferenceJobGenerator(JobGenerator):
             # pick the dataloader based on predict data
             if self.inferenceDataset:
                 logger.info(f"Using a specified dataset for dataloader (usually the case during inference): {self.inferenceDataset}")
+                match_eval_transforms(self.inferenceDataset, datamodule)
                 dataloader:DataLoader[InferenceDataset] = DataLoader(self.inferenceDataset, collate_fn=datamodule.external_collate_fn, pin_memory=True)
             else:
                 logger.info(f"Creating a dataloader from a datamodule. Usually the case during the validation or test step.")
@@ -1652,6 +1653,24 @@ def setup_transforms(datamodule: AnomalibDataModule, image_size: int | tuple[int
         data_subset = getattr(datamodule, f"{subset_name}_data", None)
         if data_subset is not None:
             data_subset.augmentations = augmentations
+
+def match_eval_transforms(inferenceDataset: InferenceDataset, datamodule: AnomalibDataModule) -> None:
+    """Give the images inspected at inference the transforms the test images of
+    calibration get, above all the resize to the tiling image_size.
+
+    get_ensemble_datamodule puts that resize into the datamodule (setup_transforms),
+    but the PredictDataset of an inference is not a part of the datamodule, and
+    without a transform anomalib reads its images at full resolution: its own
+    `image_size` is never applied. TileCollater would then cut each model's tile
+    out of the full image (e.g. the top-left 140 px of 1024 px instead of 256 px),
+    showing every tile model a part and scale it was never trained on.
+
+    Args:
+        inferenceDataset: The images to inspect (manager._inferenceTiledModel).
+        datamodule: The datamodule after setup_transforms.
+    """
+    inferenceDataset.transform = datamodule.test_augmentations
+    logger.info(f"Images to inspect are transformed like the test images: {inferenceDataset.transform}")
 
 def get_ensemble_tiler(tiling_args: Dict[str,Any]) -> EnsembleTiler:
     """Get tiler used for image tiling and to obtain tile dimensions.
