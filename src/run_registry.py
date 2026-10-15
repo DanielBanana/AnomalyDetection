@@ -478,6 +478,12 @@ def list_runs(
         print(f"Checking {manifestPath}")
         logger.debug(f"Checking {manifestPath}")
         runDir = manifestPath.parent
+        # Inference runs (<runKind>/runs/<runId> with runKind "inference", see
+        # run_paths.resolve_output_dir) hold no model of their own: never a
+        # candidate for a product's latest or best run. Older ones still carry
+        # copied checkpoints, which made them look complete.
+        if runDir.parent.parent.name == "inference":
+            continue
         try:
             with open(manifestPath) as f:
                 manifest = yaml.safe_load(f)

@@ -1255,7 +1255,10 @@ class AnomalyDetectionManager:
             tilingConfigPath=tilingConfigPath, inferencerConfigPath=inferencerConfigPath,
             modelConfig=modelConfig,
         ).copy_to(ctx.outputDir)
-        copy_checkpoints(self.ckptDir, ctx.outputDir)
+        # Not copied into the inference run (unlike eval(), whose run becomes a
+        # product's model folder): inspection reads them where they are, and a
+        # copy per inspected image filled the disk. The run's log names them.
+        logger.info(f"Checkpoints are read from {self.ckptDir}; they are not copied into this inference run.")
 
         self._inferenceTiledModel(
             trainingDir=modelTrainingDir, 
